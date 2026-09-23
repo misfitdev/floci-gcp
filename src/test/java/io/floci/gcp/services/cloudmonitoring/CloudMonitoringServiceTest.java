@@ -15,6 +15,7 @@ import com.google.protobuf.Timestamp;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.PageToken;
 import io.floci.gcp.core.storage.InMemoryStorage;
+import io.floci.gcp.core.storage.ProjectAwareStorageBackend;
 import io.floci.gcp.services.cloudmonitoring.model.StoredTimeSeriesPoint;
 import io.floci.gcp.core.storage.StorageBackend;
 import org.junit.jupiter.api.BeforeEach;
@@ -43,6 +44,82 @@ class CloudMonitoringServiceTest {
         timeSeriesStore = new InMemoryStorage<>();
         service = new CloudMonitoringService(new InMemoryStorage<>(), timeSeriesStore,
                 Clock.fixed(NOW, ZoneOffset.UTC));
+    }
+
+    @Test
+    void requestProjectsIsolateDescriptorsAndIdenticalTimeSeries() {
+        var descriptors = new ProjectAwareStorageBackend<String>(new InMemoryStorage<>(), null, "ambient-project");
+        var points = new ProjectAwareStorageBackend<StoredTimeSeriesPoint>(new InMemoryStorage<>(), null, "ambient-project");
+        service = new CloudMonitoringService(descriptors, points, Clock.fixed(NOW, ZoneOffset.UTC));
+        String other = "projects/p2";
+        String firstName = PROJECT + "/metricDescriptors/" + METRIC;
+        String otherName = other + "/metricDescriptors/" + METRIC;
+        service.createMetricDescriptor(PROJECT, descriptor(METRIC).setDescription("first").build());
+        service.createMetricDescriptor(other, descriptor(METRIC).setDescription("other").build());
+        service.createTimeSeries(PROJECT, List.of(gaugePoint(METRIC, Map.of(), 11, NOW.minusSeconds(60))));
+        service.createTimeSeries(other, List.of(gaugePoint(METRIC, Map.of(), 22, NOW.minusSeconds(60))));
+
+        assertEquals("first", service.getMetricDescriptor(firstName).getDescription());
+        assertEquals("other", service.getMetricDescriptor(otherName).getDescription());
+        assertEquals(List.of(firstName), service.listMetricDescriptors(PROJECT, null, 0, null)
+                .items().stream().map(MetricDescriptor::getName).toList());
+        assertEquals(List.of(otherName), service.listMetricDescriptors(other, null, 0, null)
+                .items().stream().map(MetricDescriptor::getName).toList());
+        var window = interval(NOW.minusSeconds(120), NOW);
+        assertEquals(11, service.listTimeSeries(PROJECT, typeFilter(), window,
+                Aggregation.getDefaultInstance(), "FULL", 0, null).items().getFirst().getPoints(0).getValue().getDoubleValue());
+        assertEquals(22, service.listTimeSeries(other, typeFilter(), window,
+                Aggregation.getDefaultInstance(), "FULL", 0, null).items().getFirst().getPoints(0).getValue().getDoubleValue());
+        assertTrue(descriptors.keys().isEmpty());
+        assertTrue(points.keys().isEmpty());
+
+        service.deleteMetricDescriptor(firstName);
+        assertEquals("NOT_FOUND", assertThrows(GcpException.class,
+                () -> service.getMetricDescriptor(firstName)).getGcpStatus());
+        assertTrue(service.listMetricDescriptors(PROJECT, null, 0, null).items().isEmpty());
+        assertTrue(service.listTimeSeries(PROJECT, typeFilter(), window,
+                Aggregation.getDefaultInstance(), "FULL", 0, null).items().isEmpty());
+        assertEquals("other", service.getMetricDescriptor(otherName).getDescription());
+        assertEquals(22, service.listTimeSeries(other, typeFilter(), window,
+                Aggregation.getDefaultInstance(), "FULL", 0, null).items().getFirst().getPoints(0).getValue().getDoubleValue());
+        service.deleteMetricDescriptor(otherName);
+        assertTrue(descriptors.scanAllProjects(k -> true).isEmpty());
+        assertTrue(points.scanAllProjects(k -> true).isEmpty());
+    }
+
+    @Test
+    void hierarchyTimeSeriesReadsAreEmptyWithoutExposingProjectData() {
+        var descriptors = new ProjectAwareStorageBackend<String>(new InMemoryStorage<>(), null, "ambient");
+        var points = new ProjectAwareStorageBackend<StoredTimeSeriesPoint>(new InMemoryStorage<>(), null, "ambient");
+        service = new CloudMonitoringService(descriptors, points, Clock.fixed(NOW, ZoneOffset.UTC));
+        service.createTimeSeries(PROJECT, List.of(gaugePoint(METRIC, Map.of(), 11, NOW.minusSeconds(60))));
+        service.createTimeSeries("projects/p2", List.of(gaugePoint(METRIC, Map.of(), 22, NOW.minusSeconds(60))));
+        for (String parent : List.of("organizations/123", "folders/456")) {
+            for (String view : List.of("FULL", "HEADERS")) {
+                var page = service.listTimeSeries(parent, typeFilter(), interval(NOW.minusSeconds(120), NOW),
+                        Aggregation.getDefaultInstance(), view, 1, null);
+                assertTrue(page.items().isEmpty());
+                assertNull(page.nextPageToken());
+            }
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.listTimeSeries(parent, "", interval(NOW.minusSeconds(120), NOW),
+                            Aggregation.getDefaultInstance(), "FULL", 0, null)).getGcpStatus());
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.listTimeSeries(parent, typeFilter(), TimeInterval.getDefaultInstance(),
+                            Aggregation.getDefaultInstance(), "FULL", 0, null)).getGcpStatus());
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.createMetricDescriptor(parent, descriptor(METRIC).build())).getGcpStatus());
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.createTimeSeries(parent, List.of(gaugePoint(METRIC, Map.of(), 1, NOW.minusSeconds(30)))))
+                    .getGcpStatus());
+        }
+        for (String invalid : List.of("organizations/", "folders/", "folders/456/extra", "billingAccounts/123")) {
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.listTimeSeries(invalid, typeFilter(), interval(NOW.minusSeconds(120), NOW),
+                            Aggregation.getDefaultInstance(), "FULL", 0, null)).getGcpStatus());
+        }
+        assertEquals(1, list(typeFilter(), interval(NOW.minusSeconds(120), NOW)).items().size());
+        assertEquals(2, points.scanAllProjects(k -> true).size());
     }
 
     // ── Metric descriptors ───────────────────────────────────────────────────

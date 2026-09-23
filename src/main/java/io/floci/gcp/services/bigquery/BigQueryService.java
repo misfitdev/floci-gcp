@@ -14,9 +14,11 @@ import io.floci.gcp.services.bigquery.model.ErrorProto;
 import io.floci.gcp.services.bigquery.model.StoredJob;
 import io.floci.gcp.services.bigquery.model.StoredTableData;
 import io.floci.gcp.services.bigquery.model.Table;
+import io.floci.gcp.services.bigquery.model.TableFieldSchema;
 import io.floci.gcp.services.bigquery.model.TableReference;
 import io.floci.gcp.services.bigquery.model.TableRow;
 import io.floci.gcp.services.bigquery.model.TableSchema;
+import io.floci.gcp.services.bigquery.model.UpdateMode;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
@@ -31,9 +33,10 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * BigQuery Phase 1: datasets/tables metadata, streaming inserts ({@code insertAll}),
- * row reads, and a trivial {@code SELECT *} / {@code COUNT(*)} query path. Storage is
- * project-namespaced via {@link StorageFactory#create}.
+ * BigQuery: datasets/tables metadata, streaming inserts ({@code insertAll}), row reads and
+ * query jobs. Queries run on a {@link BigQuerySqlEngine}: GoogleSQL on the DuckDB sidecar, or
+ * the built-in SQL subset in mock mode. Storage is project-namespaced via
+ * {@link StorageFactory#create}.
  */
 @ApplicationScoped
 public class BigQueryService {
@@ -47,12 +50,14 @@ public class BigQueryService {
 
     private final ServiceRegistry serviceRegistry;
     private final EmulatorConfig config;
+    private final BigQuerySqlEngine engine;
 
     @Inject
     public BigQueryService(ServiceRegistry serviceRegistry, EmulatorConfig config,
-            StorageFactory storageFactory) {
+            StorageFactory storageFactory, DuckSqlEngine duckEngine) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
+        this.engine = config.services().bigquery().mock() ? new InMemorySqlEngine() : duckEngine;
         this.datasetStore = storageFactory.create("bigquery-datasets", "bigquery-datasets.json",
                 new TypeReference<Map<String, Dataset>>() {});
         this.tableStore = storageFactory.create("bigquery-tables", "bigquery-tables.json",
@@ -67,6 +72,15 @@ public class BigQueryService {
             StorageBackend<String, Table> tableStore,
             StorageBackend<String, StoredTableData> dataStore,
             StorageBackend<String, StoredJob> jobStore) {
+        this(datasetStore, tableStore, dataStore, jobStore, new InMemorySqlEngine());
+    }
+
+    BigQueryService(StorageBackend<String, Dataset> datasetStore,
+            StorageBackend<String, Table> tableStore,
+            StorageBackend<String, StoredTableData> dataStore,
+            StorageBackend<String, StoredJob> jobStore,
+            BigQuerySqlEngine engine) {
+        this.engine = engine;
         this.datasetStore = datasetStore;
         this.tableStore = tableStore;
         this.dataStore = dataStore;
@@ -80,7 +94,7 @@ public class BigQueryService {
                 .enabled(config.services().bigquery().enabled())
                 .storageKey("bigquery")
                 .protocol(ServiceProtocol.REST)
-                .resourceClasses(BigQueryController.class)
+                .resourceClasses(BigQueryController.class, BigQueryInternalController.class)
                 .build());
     }
 
@@ -97,8 +111,14 @@ public class BigQueryService {
                     .withReason("duplicate");
         }
         String now = nowMillis();
+        Map<String, Object> extra = BigQueryMetadata.writable(body.getExtra(), BigQueryMetadata.DATASET_FIELDS);
+        BigQueryMetadata.validateDataset(extra);
+        body.getExtra().clear();
+        body.getExtra().putAll(extra);
+        BigQueryMetadata.fillDatasetOutputs(body);
         body.setDatasetReference(new DatasetReference(projectId, datasetId));
         body.setId(projectId + ":" + datasetId);
+        body.setSelfLink(selfLink(projectId, datasetId, null));
         body.setEtag(etag());
         body.setCreationTime(now);
         body.setLastModifiedTime(now);
@@ -117,15 +137,31 @@ public class BigQueryService {
     }
 
     public Dataset patchDataset(String projectId, String datasetId, Dataset patch) {
+        return patchDataset(projectId, datasetId, patch, UpdateMode.UPDATE_FULL);
+    }
+
+    /** datasets.patch, honouring {@code updateMode}. */
+    public Dataset patchDataset(String projectId, String datasetId, Dataset patch, UpdateMode mode) {
         Dataset existing = getDataset(projectId, datasetId);
-        if (patch.getFriendlyName() != null) {
-            existing.setFriendlyName(patch.getFriendlyName());
+        if (mode.touchesMetadata()) {
+            Map<String, Object> candidate = new LinkedHashMap<>(existing.getExtra());
+            BigQueryMetadata.patch(candidate, patch.getExtra(), BigQueryMetadata.DATASET_FIELDS);
+            clearZeroDefaultExpiration(candidate);
+            BigQueryMetadata.validateDataset(candidate);
+            if (patch.getFriendlyName() != null) {
+                existing.setFriendlyName(patch.getFriendlyName());
+            }
+            if (patch.getDescription() != null) {
+                existing.setDescription(patch.getDescription());
+            }
+            if (patch.getLabels() != null) {
+                existing.setLabels(patch.getLabels());
+            }
+            replaceExtra(existing.getExtra(), candidate);
+            BigQueryMetadata.fillDatasetOutputs(existing);
         }
-        if (patch.getDescription() != null) {
-            existing.setDescription(patch.getDescription());
-        }
-        if (patch.getLabels() != null) {
-            existing.setLabels(patch.getLabels());
+        if (mode.touchesAcl() && patch.getAccess() != null) {
+            existing.setAccess(patch.getAccess());
         }
         existing.setLastModifiedTime(nowMillis());
         existing.setEtag(etag());
@@ -133,12 +169,53 @@ public class BigQueryService {
         return existing;
     }
 
+    /** "To clear an existing default expiration with a PATCH request, set to 0." */
+    private static void clearZeroDefaultExpiration(Map<String, Object> extra) {
+        Object value = extra.get("defaultTableExpirationMs");
+        if (value != null && "0".equals(String.valueOf(value).trim())) {
+            extra.remove("defaultTableExpirationMs");
+        }
+    }
+
+    /**
+     * Writable metadata is validated on a detached copy and only then committed, so a request that
+     * fails validation leaves the stored resource untouched: the storage backends hand out the live
+     * object, so mutating it before validating would publish a rejected update.
+     */
+    private static void replaceExtra(Map<String, Object> target, Map<String, Object> candidate) {
+        target.clear();
+        target.putAll(candidate);
+    }
+
     /** datasets.update (PUT): full replacement — mutable fields absent from the body are cleared. */
     public Dataset updateDataset(String projectId, String datasetId, Dataset update) {
+        return updateDataset(projectId, datasetId, update, UpdateMode.UPDATE_FULL);
+    }
+
+    /**
+     * datasets.update, honouring {@code updateMode}.
+     *
+     * <p>PUT replaces, so a field absent from the body is a cleared field. That
+     * is only safe for the half of the resource the caller addressed:
+     * UPDATE_METADATA leaves the ACL exactly as it was, UPDATE_ACL leaves the
+     * metadata alone, and UPDATE_FULL (the default) replaces both.
+     */
+    public Dataset updateDataset(
+            String projectId, String datasetId, Dataset update, UpdateMode mode) {
         Dataset existing = getDataset(projectId, datasetId);
-        existing.setFriendlyName(update.getFriendlyName());
-        existing.setDescription(update.getDescription());
-        existing.setLabels(update.getLabels());
+        if (mode.touchesMetadata()) {
+            Map<String, Object> candidate = new LinkedHashMap<>(existing.getExtra());
+            BigQueryMetadata.replace(candidate, update.getExtra(), BigQueryMetadata.DATASET_FIELDS);
+            BigQueryMetadata.validateDataset(candidate);
+            existing.setFriendlyName(update.getFriendlyName());
+            existing.setDescription(update.getDescription());
+            existing.setLabels(update.getLabels());
+            replaceExtra(existing.getExtra(), candidate);
+            BigQueryMetadata.fillDatasetOutputs(existing);
+        }
+        if (mode.touchesAcl()) {
+            existing.setAccess(update.getAccess());
+        }
         existing.setLastModifiedTime(nowMillis());
         existing.setEtag(etag());
         datasetStore.put(datasetId, existing);
@@ -165,7 +242,7 @@ public class BigQueryService {
     // ── Tables ───────────────────────────────────────────────────────────────────
 
     public Table createTable(String projectId, String datasetId, Table body) {
-        getDataset(projectId, datasetId);
+        Dataset dataset = getDataset(projectId, datasetId);
         String tableId = body.getTableReference() != null
                 ? body.getTableReference().getTableId() : null;
         if (tableId == null || tableId.isBlank()) {
@@ -179,6 +256,24 @@ public class BigQueryService {
         }
         String now = nowMillis();
         body.setSchema(RowCodec.normalizeSchema(body.getSchema()));
+        Map<String, Object> extra = BigQueryMetadata.writable(body.getExtra(), BigQueryMetadata.TABLE_FIELDS);
+        body.getExtra().clear();
+        body.getExtra().putAll(extra);
+        BigQueryMetadata.validateTable(extra, schemaFields(body));
+        BigQueryMetadata.applyDatasetDefaults(body, dataset, Long.parseLong(now));
+        if (body.getType() == null && extra.containsKey("view")) {
+            body.setType("VIEW");
+        } else if (body.getType() == null && extra.containsKey("materializedView")) {
+            body.setType("MATERIALIZED_VIEW");
+        } else if (body.getType() == null && extra.containsKey("externalDataConfiguration")) {
+            body.setType("EXTERNAL");
+        }
+        body.setLocation(dataset.getLocation());
+        // numRows is maintained on insert, but nothing tracks a byte size, and a table with rows
+        // reporting numBytes "0" is worse than one that omits the field. numLongTermBytes stays
+        // "0" because nothing here ever ages into long-term storage.
+        body.setNumLongTermBytes("0");
+        body.setSelfLink(selfLink(projectId, datasetId, tableId));
         body.setTableReference(new TableReference(projectId, datasetId, tableId));
         body.setId(projectId + ":" + datasetId + "." + tableId);
         body.setType(body.getType() != null ? body.getType() : "TABLE");
@@ -193,17 +288,50 @@ public class BigQueryService {
 
     public Table getTable(String projectId, String datasetId, String tableId) {
         return tableStore.get(tableKey(datasetId, tableId))
+                .filter(table -> !expire(datasetId, tableId, table))
                 .orElseThrow(() -> GcpException.notFound(
                         "Not found: Table " + projectId + ":" + datasetId + "." + tableId));
     }
 
     public List<Table> listTables(String projectId, String datasetId) {
         String prefix = datasetId + "/";
-        return tableStore.scan(k -> k.startsWith(prefix));
+        return tableStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(table -> !expire(datasetId, table.getTableReference().getTableId(), table))
+                .toList();
+    }
+
+    /** "Expired tables will be deleted": removes the table (and its rows) once past expirationTime. */
+    private boolean expire(String datasetId, String tableId, Table table) {
+        if (!BigQueryMetadata.expired(table, System.currentTimeMillis())) {
+            return false;
+        }
+        tableStore.delete(tableKey(datasetId, tableId));
+        dataStore.delete(tableKey(datasetId, tableId));
+        LOG.debugf("table expired dataset=%s table=%s", datasetId, tableId);
+        return true;
+    }
+
+    private static List<TableFieldSchema> schemaFields(Table table) {
+        return schemaFields(table.getSchema());
+    }
+
+    private static List<TableFieldSchema> schemaFields(TableSchema schema) {
+        return schema != null && schema.getFields() != null ? schema.getFields() : List.of();
+    }
+
+    private String selfLink(String projectId, String datasetId, String tableId) {
+        String base = config != null ? config.effectiveBaseUrl() : "";
+        return base + "/bigquery/v2/projects/" + projectId + "/datasets/" + datasetId
+                + (tableId != null ? "/tables/" + tableId : "");
     }
 
     public Table patchTable(String projectId, String datasetId, String tableId, Table patch) {
         Table existing = getTable(projectId, datasetId, tableId);
+        TableSchema schema = patch.getSchema() != null
+                ? RowCodec.normalizeSchema(patch.getSchema()) : existing.getSchema();
+        Map<String, Object> candidate = new LinkedHashMap<>(existing.getExtra());
+        BigQueryMetadata.patch(candidate, patch.getExtra(), BigQueryMetadata.TABLE_FIELDS);
+        BigQueryMetadata.validateTable(candidate, schemaFields(schema));
         if (patch.getFriendlyName() != null) {
             existing.setFriendlyName(patch.getFriendlyName());
         }
@@ -211,11 +339,12 @@ public class BigQueryService {
             existing.setDescription(patch.getDescription());
         }
         if (patch.getSchema() != null) {
-            existing.setSchema(RowCodec.normalizeSchema(patch.getSchema()));
+            existing.setSchema(schema);
         }
         if (patch.getLabels() != null) {
             existing.setLabels(patch.getLabels());
         }
+        replaceExtra(existing.getExtra(), candidate);
         existing.setLastModifiedTime(nowMillis());
         existing.setEtag(etag());
         tableStore.put(tableKey(datasetId, tableId), existing);
@@ -225,10 +354,15 @@ public class BigQueryService {
     /** tables.update (PUT): full replacement — mutable fields absent from the body are cleared. */
     public Table updateTable(String projectId, String datasetId, String tableId, Table update) {
         Table existing = getTable(projectId, datasetId, tableId);
+        TableSchema schema = update.getSchema() != null ? RowCodec.normalizeSchema(update.getSchema()) : null;
+        Map<String, Object> candidate = new LinkedHashMap<>(existing.getExtra());
+        BigQueryMetadata.replace(candidate, update.getExtra(), BigQueryMetadata.TABLE_FIELDS);
+        BigQueryMetadata.validateTable(candidate, schemaFields(schema));
         existing.setFriendlyName(update.getFriendlyName());
         existing.setDescription(update.getDescription());
-        existing.setSchema(update.getSchema() != null ? RowCodec.normalizeSchema(update.getSchema()) : null);
+        existing.setSchema(schema);
         existing.setLabels(update.getLabels());
+        replaceExtra(existing.getExtra(), candidate);
         existing.setLastModifiedTime(nowMillis());
         existing.setEtag(etag());
         tableStore.put(tableKey(datasetId, tableId), existing);
@@ -297,9 +431,24 @@ public class BigQueryService {
     public record TableData(TableSchema schema, List<TableRow> rows) {}
 
     public TableData listTableData(String projectId, String datasetId, String tableId) {
+        return listTableData(projectId, datasetId, tableId, RowCodec.TimestampFormat.FLOAT64);
+    }
+
+    public TableData listTableData(String projectId, String datasetId, String tableId,
+            RowCodec.TimestampFormat format) {
         Table table = getTable(projectId, datasetId, tableId);
         StoredTableData data = dataStore.get(tableKey(datasetId, tableId)).orElseGet(StoredTableData::new);
-        return new TableData(table.getSchema(), RowCodec.encodeRows(table.getSchema(), data.getRows()));
+        return new TableData(table.getSchema(), RowCodec.encodeRows(table.getSchema(), data.getRows(), format));
+    }
+
+    /** Stored (normalized) rows of a table, as the SQL engine stages them. */
+    public List<Map<String, Object>> storedRows(String projectId, String datasetId, String tableId) {
+        getTable(projectId, datasetId, tableId);
+        // A snapshot, not the stored list. Callers stream these rows to the SQL engine from a
+        // StreamingOutput, so the list would otherwise be iterated after the request method has
+        // returned, while insertAll appends to that same list.
+        return List.copyOf(dataStore.get(tableKey(datasetId, tableId))
+                .orElseGet(StoredTableData::new).getRows());
     }
 
     // ── Query ────────────────────────────────────────────────────────────────────
@@ -307,52 +456,78 @@ public class BigQueryService {
     /** Hidden dataset holding materialized query results; never listed, has no dataset record. */
     static final String ANON_DATASET = "_floci_anon";
 
+    /** Request-level options of {@code jobs.query} / {@code jobs.insert} that shape execution. */
+    public record QueryOptions(String sql, String defaultDatasetId, List<Map<String, Object>> queryParameters,
+                               String parameterMode, boolean dryRun, Boolean useLegacySql) {
+
+        public static QueryOptions of(String sql, String defaultDatasetId) {
+            return new QueryOptions(sql, defaultDatasetId, List.of(), null, false, null);
+        }
+    }
+
+    public StoredJob query(String projectId, String location, String jobId, String sql, String defaultDatasetId) {
+        return query(projectId, location, jobId, QueryOptions.of(sql, defaultDatasetId));
+    }
+
     /**
-     * Parses and executes the SQL subset, materializing results into a hidden anonymous
-     * table referenced as the job's {@code configuration.query.destinationTable} (the SDK's
+     * Executes the query and materializes its results into a hidden anonymous table
+     * referenced as the job's {@code configuration.query.destinationTable} (the SDK's
      * {@code Job.getQueryResults()} reads rows from there via {@code tabledata.list}).
-     * SQL errors propagate as {@link GcpException} — {@code jobs.query} maps them to HTTP
+     * SQL errors propagate as {@link GcpException}: {@code jobs.query} maps them to HTTP
      * errors while {@code jobs.insert} converts them into a DONE job with an error status.
+     * Dry runs return an unpersisted job carrying the result schema.
      */
-    public StoredJob query(String projectId, String location, String jobId,
-            String sql, String defaultDatasetId) {
+    public StoredJob query(String projectId, String location, String jobId, QueryOptions options) {
         // Reserve the ID before any parsing/lookup so a duplicate explicit jobId always
-        // 409s — even when the query would otherwise fail — matching failedJob's path.
-        String resolvedJobId = reserveJobId(projectId, jobId);
-        QueryEngine.ParsedQuery parsed = QueryEngine.parse(sql);
-
-        QueryEngine.TableRef ref = parsed.table();
-        if (ref.projectId() != null && !ref.projectId().equals(projectId)) {
-            throw QueryEngine.invalidQuery(
-                    "Cross-project queries are not supported by the Phase 1 emulator: "
-                            + ref.projectId() + "." + ref.datasetId() + "." + ref.tableId());
-        }
-        String datasetId = ref.datasetId() != null ? ref.datasetId() : defaultDatasetId;
-        if (datasetId == null || datasetId.isBlank()) {
-            throw QueryEngine.invalidQuery("Table name \"" + ref.tableId()
-                    + "\" missing dataset while no default dataset is set in the request.");
+        // 409s, even when the query would otherwise fail, matching failedJob's path.
+        String resolvedJobId = options.dryRun() ? null : reserveJobId(projectId, jobId);
+        if (Boolean.TRUE.equals(options.useLegacySql())) {
+            throw QueryEngine.invalidQuery("Legacy SQL is not supported by the floci BigQuery emulator;"
+                    + " set useLegacySql to false to run GoogleSQL.");
         }
 
-        Table table = getTable(projectId, datasetId, ref.tableId());
-        StoredTableData data = dataStore.get(tableKey(datasetId, ref.tableId()))
-                .orElseGet(StoredTableData::new);
-
-        QueryEngine.Result result = QueryEngine.evaluate(parsed, table.getSchema(), data.getRows());
+        BigQuerySqlEngine.Result result = engine.execute(new BigQuerySqlEngine.Request(projectId, options.sql(),
+                options.defaultDatasetId(), options.queryParameters(), options.parameterMode(), options.dryRun()),
+                tables(projectId));
 
         StoredJob job = new StoredJob();
         job.setJobId(resolvedJobId);
         job.setProjectId(projectId);
         job.setLocation(location != null && !location.isBlank() ? location : "US");
-        job.setQuery(sql);
+        job.setQuery(options.sql());
         job.setState("DONE");
         job.setCreationTime(nowMillis());
+        job.setStatementType(result.statementType());
+        job.setTotalBytesProcessed(String.valueOf(result.totalBytesProcessed()));
+        if (options.dryRun()) {
+            job.setDryRun(true);
+            job.setSchema(result.schema());
+            return job;
+        }
         job.setTotalRows(result.rows().size());
         job.setDestinationDatasetId(ANON_DATASET);
         job.setDestinationTableId("anon_" + job.getJobId());
 
-        materializeResult(projectId, job, result);
+        materializeResult(projectId, job, result.schema(), result.rows());
         jobStore.put(job.getJobId(), job);
         return job;
+    }
+
+    BigQuerySqlEngine.Tables tables(String projectId) {
+        return new BigQuerySqlEngine.Tables() {
+            @Override
+            public Table table(String datasetId, String tableId) {
+                return getTable(projectId, datasetId, tableId);
+            }
+
+            @Override
+            public List<Map<String, Object>> rows(String datasetId, String tableId) {
+                // A snapshot for the same reason storedRows takes one: the engines iterate these
+                // rows (to estimate bytes, and to evaluate in mock mode) while insertAll can be
+                // appending to the very same list.
+                return storedRows(projectId, datasetId, tableId);
+            }
+        };
     }
 
     /** Persists a failed query job (used by {@code jobs.insert}, which must not throw for SQL errors). */
@@ -384,21 +559,22 @@ public class BigQueryService {
         return jobId;
     }
 
-    private void materializeResult(String projectId, StoredJob job, QueryEngine.Result result) {
+    private void materializeResult(String projectId, StoredJob job, TableSchema schema,
+            List<Map<String, Object>> resultRows) {
         String key = tableKey(job.getDestinationDatasetId(), job.getDestinationTableId());
         Table anon = new Table();
         anon.setTableReference(new TableReference(projectId,
                 job.getDestinationDatasetId(), job.getDestinationTableId()));
         anon.setId(projectId + ":" + job.getDestinationDatasetId() + "." + job.getDestinationTableId());
         anon.setType("TABLE");
-        anon.setSchema(result.schema());
+        anon.setSchema(schema);
         anon.setCreationTime(job.getCreationTime());
         anon.setLastModifiedTime(job.getCreationTime());
-        anon.setNumRows(String.valueOf(result.rows().size()));
+        anon.setNumRows(String.valueOf(resultRows.size()));
         tableStore.put(key, anon);
 
         StoredTableData rows = new StoredTableData();
-        rows.setRows(new ArrayList<>(result.rows()));
+        rows.setRows(new ArrayList<>(resultRows));
         dataStore.put(key, rows);
     }
 
@@ -425,10 +601,14 @@ public class BigQueryService {
 
     /** Encoded result rows for {@code getQueryResults}, read from the job's anonymous table. */
     public TableData queryResults(String projectId, StoredJob job) {
+        return queryResults(projectId, job, RowCodec.TimestampFormat.FLOAT64);
+    }
+
+    public TableData queryResults(String projectId, StoredJob job, RowCodec.TimestampFormat format) {
         if (job.failed()) {
             throw GcpException.invalidArgument(job.getErrorMessage()).withReason(job.getErrorReason());
         }
-        return listTableData(projectId, job.getDestinationDatasetId(), job.getDestinationTableId());
+        return listTableData(projectId, job.getDestinationDatasetId(), job.getDestinationTableId(), format);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────

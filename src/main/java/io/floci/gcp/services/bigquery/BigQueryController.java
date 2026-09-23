@@ -3,6 +3,7 @@ package io.floci.gcp.services.bigquery;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.PageToken;
 import io.floci.gcp.services.bigquery.model.Dataset;
+import io.floci.gcp.services.bigquery.model.UpdateMode;
 import io.floci.gcp.services.bigquery.model.ErrorProto;
 import io.floci.gcp.services.bigquery.model.Job;
 import io.floci.gcp.services.bigquery.model.JobReference;
@@ -87,16 +88,20 @@ public class BigQueryController {
     @Path("/{projectId}/datasets/{datasetId}")
     @Consumes(MediaType.APPLICATION_JSON)
     public Response patchDataset(@PathParam("projectId") String projectId,
-            @PathParam("datasetId") String datasetId, Dataset body) {
-        return Response.ok(service.patchDataset(projectId, datasetId, body != null ? body : new Dataset())).build();
+            @PathParam("datasetId") String datasetId,
+            @QueryParam("updateMode") String updateMode, Dataset body) {
+        return Response.ok(service.patchDataset(projectId, datasetId,
+                body != null ? body : new Dataset(), UpdateMode.from(updateMode))).build();
     }
 
     @PUT
     @Path("/{projectId}/datasets/{datasetId}")
     @Consumes(MediaType.APPLICATION_JSON)
     public Response updateDataset(@PathParam("projectId") String projectId,
-            @PathParam("datasetId") String datasetId, Dataset body) {
-        return Response.ok(service.updateDataset(projectId, datasetId, body != null ? body : new Dataset())).build();
+            @PathParam("datasetId") String datasetId,
+            @QueryParam("updateMode") String updateMode, Dataset body) {
+        return Response.ok(service.updateDataset(projectId, datasetId,
+                body != null ? body : new Dataset(), UpdateMode.from(updateMode))).build();
     }
 
     @POST
@@ -104,9 +109,11 @@ public class BigQueryController {
     @Consumes(MediaType.APPLICATION_JSON)
     public Response postDatasetMethodOverride(@PathParam("projectId") String projectId,
             @PathParam("datasetId") String datasetId,
-            @HeaderParam("X-HTTP-Method-Override") String methodOverride, Dataset body) {
+            @HeaderParam("X-HTTP-Method-Override") String methodOverride,
+            @QueryParam("updateMode") String updateMode, Dataset body) {
         if ("PATCH".equalsIgnoreCase(methodOverride)) {
-            return Response.ok(service.patchDataset(projectId, datasetId, body != null ? body : new Dataset())).build();
+            return Response.ok(service.patchDataset(projectId, datasetId,
+                    body != null ? body : new Dataset(), UpdateMode.from(updateMode))).build();
         }
         throw GcpException.invalidArgument("unsupported method override: " + methodOverride);
     }
@@ -219,8 +226,11 @@ public class BigQueryController {
             @PathParam("datasetId") String datasetId, @PathParam("tableId") String tableId,
             @QueryParam("maxResults") Long maxResults,
             @QueryParam("pageToken") String pageToken,
-            @QueryParam("startIndex") Long startIndex) {
-        BigQueryService.TableData data = service.listTableData(projectId, datasetId, tableId);
+            @QueryParam("startIndex") Long startIndex,
+            @QueryParam("formatOptions.useInt64Timestamp") Boolean useInt64Timestamp,
+            @QueryParam("formatOptions.timestampOutputFormat") String timestampOutputFormat) {
+        BigQueryService.TableData data = service.listTableData(projectId, datasetId, tableId,
+                RowCodec.TimestampFormat.of(useInt64Timestamp, timestampOutputFormat));
         PageToken.Page<TableRow> page = pageRows(data.rows(), maxResults, pageToken, startIndex);
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("kind", "bigquery#tableDataList");
@@ -240,14 +250,19 @@ public class BigQueryController {
     @Path("/{projectId}/queries")
     @Consumes(MediaType.APPLICATION_JSON)
     public Response query(@PathParam("projectId") String projectId, Map<String, Object> body) {
-        String sql = body != null ? (String) body.get("query") : null;
-        String location = body != null ? (String) body.get("location") : null;
-        Map<String, Object> defaultDataset = body != null ? asMap(body.get("defaultDataset")) : null;
-        String defaultDatasetId = defaultDataset != null ? (String) defaultDataset.get("datasetId") : null;
+        Map<String, Object> request = body != null ? body : Map.of();
+        String location = (String) request.get("location");
+        BigQueryService.QueryOptions options = queryOptions(request, Boolean.TRUE.equals(request.get("dryRun")));
+        StoredJob job = service.query(projectId, location, null, options);
 
-        StoredJob job = service.query(projectId, location, null, sql, defaultDatasetId);
-        Long maxResults = body != null && body.get("maxResults") instanceof Number n ? n.longValue() : null;
-        QueryResponse resp = buildQueryResponse(job, maxResults, null, null);
+        Map<String, Object> formatOptions = asMap(request.get("formatOptions"));
+        RowCodec.TimestampFormat format = formatOptions != null
+                ? RowCodec.TimestampFormat.of(formatOptions.get("useInt64Timestamp") instanceof Boolean b ? b : null,
+                        (String) formatOptions.get("timestampOutputFormat"))
+                : RowCodec.TimestampFormat.FLOAT64;
+        Long maxResults = request.get("maxResults") instanceof Number n ? n.longValue() : null;
+        QueryResponse resp = job.isDryRun() ? buildDryRunResponse(job)
+                : buildQueryResponse(job, maxResults, null, null, format);
         resp.setKind("bigquery#queryResponse");
         return Response.ok(resp).build();
     }
@@ -258,9 +273,12 @@ public class BigQueryController {
             @PathParam("jobId") String jobId,
             @QueryParam("maxResults") Long maxResults,
             @QueryParam("pageToken") String pageToken,
-            @QueryParam("startIndex") Long startIndex) {
+            @QueryParam("startIndex") Long startIndex,
+            @QueryParam("formatOptions.useInt64Timestamp") Boolean useInt64Timestamp,
+            @QueryParam("formatOptions.timestampOutputFormat") String timestampOutputFormat) {
         StoredJob job = service.getJob(projectId, jobId);
-        QueryResponse resp = buildQueryResponse(job, maxResults, pageToken, startIndex);
+        QueryResponse resp = buildQueryResponse(job, maxResults, pageToken, startIndex,
+                RowCodec.TimestampFormat.of(useInt64Timestamp, timestampOutputFormat));
         resp.setKind("bigquery#getQueryResultsResponse");
         return Response.ok(resp).build();
     }
@@ -273,23 +291,23 @@ public class BigQueryController {
         Map<String, Object> queryConfig = configuration != null ? asMap(configuration.get("query")) : null;
         if (queryConfig == null || queryConfig.get("query") == null) {
             throw GcpException.invalidArgument(
-                    "Only QUERY jobs are supported in the Phase 1 BigQuery emulator");
+                    "Only QUERY jobs are supported by the floci BigQuery emulator");
         }
         String location = body.getJobReference() != null ? body.getJobReference().getLocation() : null;
         String jobId = body.getJobReference() != null ? body.getJobReference().getJobId() : null;
-        String sql = (String) queryConfig.get("query");
-        Map<String, Object> defaultDataset = asMap(queryConfig.get("defaultDataset"));
-        String defaultDatasetId = defaultDataset != null ? (String) defaultDataset.get("datasetId") : null;
+        boolean dryRun = Boolean.TRUE.equals(configuration.get("dryRun"));
+        BigQueryService.QueryOptions options = queryOptions(queryConfig, dryRun);
 
         StoredJob job;
         try {
-            job = service.query(projectId, location, jobId, sql, defaultDatasetId);
+            job = service.query(projectId, location, jobId, options);
         } catch (GcpException e) {
-            if (e.getHttpStatus() == 409) {
+            // A dry run reports an invalid query as an HTTP error; a real job records it
+            // in its status instead.
+            if (e.getHttpStatus() == 409 || dryRun) {
                 throw e;
             }
-            // jobs.insert reports SQL failures inside the job status, not as an HTTP error.
-            job = service.failedJob(projectId, location, jobId, sql, e);
+            job = service.failedJob(projectId, location, jobId, options.sql(), e);
         }
         return Response.ok(buildJob(job)).build();
     }
@@ -337,8 +355,56 @@ public class BigQueryController {
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
 
+    private static BigQueryService.QueryOptions queryOptions(Map<String, Object> config, boolean dryRun) {
+        Map<String, Object> defaultDataset = asMap(config.get("defaultDataset"));
+        String defaultDatasetId = defaultDataset != null ? string(defaultDataset.get("datasetId"),
+                "defaultDataset.datasetId") : null;
+        Boolean useLegacySql = config.get("useLegacySql") instanceof Boolean b ? b : null;
+        return new BigQueryService.QueryOptions(string(config.get("query"), "query"), defaultDatasetId,
+                queryParameters(config.get("queryParameters")), string(config.get("parameterMode"),
+                        "parameterMode"), dryRun, useLegacySql);
+    }
+
+    /**
+     * Checks the element type rather than casting the list: erasure makes the cast succeed and the
+     * failure surface later as a ClassCastException, which has no exception mapper and so reaches
+     * the client as a 500 with no GCP error body at all.
+     */
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> queryParameters(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            throw QueryEngine.invalidQuery("queryParameters must be an array");
+        }
+        for (Object entry : list) {
+            if (!(entry instanceof Map<?, ?>)) {
+                throw QueryEngine.invalidQuery("Each entry of queryParameters must be an object");
+            }
+        }
+        return (List<Map<String, Object>>) list;
+    }
+
+    private static String string(Object raw, String field) {
+        if (raw == null || raw instanceof String) {
+            return (String) raw;
+        }
+        throw QueryEngine.invalidQuery(field + " must be a string");
+    }
+
+    private static QueryResponse buildDryRunResponse(StoredJob job) {
+        QueryResponse resp = new QueryResponse();
+        resp.setJobReference(new JobReference(job.getProjectId(), null, job.getLocation()));
+        resp.setJobComplete(true);
+        resp.setCacheHit(false);
+        resp.setSchema(job.getSchema());
+        resp.setTotalBytesProcessed(job.getTotalBytesProcessed());
+        return resp;
+    }
+
     private QueryResponse buildQueryResponse(StoredJob job, Long maxResults, String pageToken,
-            Long startIndex) {
+            Long startIndex, RowCodec.TimestampFormat format) {
         QueryResponse resp = new QueryResponse();
         resp.setJobReference(new JobReference(job.getProjectId(), job.getJobId(), job.getLocation()));
         resp.setJobComplete(true);
@@ -349,9 +415,9 @@ public class BigQueryController {
             return resp;
         }
         resp.setCacheHit(false);
-        resp.setTotalBytesProcessed("0");
+        resp.setTotalBytesProcessed(job.getTotalBytesProcessed() != null ? job.getTotalBytesProcessed() : "0");
 
-        BigQueryService.TableData data = service.queryResults(job.getProjectId(), job);
+        BigQueryService.TableData data = service.queryResults(job.getProjectId(), job, format);
         resp.setSchema(data.schema());
         resp.setTotalRows(String.valueOf(data.rows().size()));
         PageToken.Page<TableRow> page = pageRows(data.rows(), maxResults, pageToken, startIndex);
@@ -364,7 +430,11 @@ public class BigQueryController {
 
     private static Job buildJob(StoredJob sj) {
         Job job = new Job();
-        job.setId(sj.getProjectId() + ":" + sj.getLocation() + "." + sj.getJobId());
+        // A dry run reserves no job id, and real BigQuery creates no job for one, so there is
+        // nothing to name here. Concatenating a null id would emit the literal string "null".
+        if (sj.getJobId() != null) {
+            job.setId(sj.getProjectId() + ":" + sj.getLocation() + "." + sj.getJobId());
+        }
         job.setJobReference(new JobReference(sj.getProjectId(), sj.getJobId(), sj.getLocation()));
 
         Map<String, Object> queryConfig = new LinkedHashMap<>();
@@ -379,6 +449,9 @@ public class BigQueryController {
         Map<String, Object> configuration = new LinkedHashMap<>();
         configuration.put("jobType", "QUERY");
         configuration.put("query", queryConfig);
+        if (sj.isDryRun()) {
+            configuration.put("dryRun", true);
+        }
         job.setConfiguration(configuration);
 
         JobStatus status = new JobStatus();
@@ -395,7 +468,15 @@ public class BigQueryController {
             statistics.put("creationTime", sj.getCreationTime());
             statistics.put("startTime", sj.getCreationTime());
             statistics.put("endTime", sj.getCreationTime());
-            statistics.put("query", Map.of("totalBytesProcessed", "0", "statementType", "SELECT"));
+            Map<String, Object> queryStatistics = new LinkedHashMap<>();
+            String bytes = sj.getTotalBytesProcessed() != null ? sj.getTotalBytesProcessed() : "0";
+            queryStatistics.put("totalBytesProcessed", bytes);
+            statistics.put("totalBytesProcessed", bytes);
+            queryStatistics.put("statementType", sj.getStatementType() != null ? sj.getStatementType() : "SELECT");
+            if (sj.isDryRun() && sj.getSchema() != null) {
+                queryStatistics.put("schema", sj.getSchema());
+            }
+            statistics.put("query", queryStatistics);
             job.setStatistics(statistics);
         }
         return job;

@@ -64,6 +64,10 @@ floci-gcp:
     wal:
       compaction-interval-ms: 30000
   services:
+    compute:
+      enabled: true
+      operation-delay-ms: 50
+      regions: us-central1,europe-west1
     gcs:
       enabled: true
       upload-session-idle-timeout-seconds: 604800
@@ -125,6 +129,14 @@ floci-gcp:
       enabled: true
     bigquery:
       enabled: true
+      mock: false
+      duck:
+        default-image: "floci/floci-duck:latest"
+        # Point at an already running floci-duck; empty starts one per emulator.
+        url:
+        # Only needed when `url` points at a sidecar that cannot reach floci-gcp through the
+        # resolved docker host. Empty means "derive it".
+        callback-url:
     gke:
       enabled: true
       mock: false

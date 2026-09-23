@@ -132,10 +132,21 @@ public interface EmulatorConfig {
         long compactionIntervalMs();
     }
 
+    interface ComputeServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+        @WithDefault("50")
+        long operationDelayMs();
+        @WithDefault("us-central1,europe-west1")
+        java.util.List<String> regions();
+    }
+
     interface ServicesConfig {
 
         /** Shared Docker network for sidecar containers. */
         Optional<String> dockerNetwork();
+
+        ComputeServiceConfig compute();
 
         GcsServiceConfig gcs();
 
@@ -197,6 +208,27 @@ public interface EmulatorConfig {
     interface BigQueryServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** When true, queries run on the built-in SQL subset instead of the DuckDB sidecar. */
+        @WithDefault("false")
+        boolean mock();
+
+        BigQueryDuckConfig duck();
+    }
+
+    interface BigQueryDuckConfig {
+        /** Pre-running floci-duck endpoint; when set, no container is started. */
+        Optional<String> url();
+
+        /**
+         * Base URL the sidecar uses to read staged rows back from floci-gcp. Only needed when
+         * {@link #url()} points at a sidecar that cannot reach this process through the resolved
+         * docker host, such as one on another machine or on a network without a host alias.
+         */
+        Optional<String> callbackUrl();
+
+        @WithDefault("floci/floci-duck:latest")
+        String defaultImage();
     }
 
     interface ResourceManagerServiceConfig {

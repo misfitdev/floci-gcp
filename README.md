@@ -159,7 +159,7 @@ GCP's official emulators are fragmented: each service ships its own binary, runs
 | Cloud Monitoring | ✅ | ❌ |
 | Service Usage | ✅ | ❌ |
 | Identity Platform / Firebase Auth | ✅ | ❌ |
-| BigQuery (Phase 1) | ✅ | ❌ |
+| BigQuery | ✅ | ❌ |
 | Eventarc | ✅ | ❌ |
 | IAM Service Account Credentials | ✅ | ❌ |
 | Security Token Service (STS) | ✅ | ❌ |
@@ -211,10 +211,11 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 | Messaging and events | Pub/Sub, Managed Kafka, Eventarc |
 | Security and identity | Secret Manager, Cloud KMS, IAM, IAM Service Account Credentials, Security Token Service (STS), Firebase Auth (Identity Platform) |
 | Container orchestration | GKE (Kubernetes Engine) |
+| Virtual machine control plane | Compute Engine, VPC networking, global external application load-balancer configuration |
 | Serverless control planes | Cloud Run, Cloud Functions |
 | Task scheduling | Cloud Tasks, Cloud Scheduler |
 | Databases | Cloud SQL for PostgreSQL and MySQL |
-| Analytics | BigQuery (Phase 1) |
+| Analytics | BigQuery |
 | Observability | Cloud Logging, Cloud Monitoring |
 | API management | Service Usage, Cloud Resource Manager (`projects.get` and IAM policy mixins) |
 
@@ -223,6 +224,7 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 
 | Service | Protocol | Notable features |
 |---|---|---|
+| **[Compute Engine](docs/services/compute.md)** | REST JSON | Scoped operations, synthetic catalogs, VPC/subnets/firewalls/addresses, VM and disk lifecycle, images/snapshots, NEGs and global HTTP load-balancer configuration; no guest execution or traffic forwarding |
 | **Cloud Storage (GCS)** | gRPC v2 + REST XML + REST JSON | Buckets, objects, streaming and resumable upload, ranged download, compose, rewrite, move, soft delete and restore, ACLs, bucket IAM, HMAC keys, conditional requests, versioning, lifecycle, CORS, decompressive transcoding, pre-signed URLs (V4), batch API, Pub/Sub object notifications, customer-supplied encryption keys (CSEK) |
 | **Pub/Sub** | gRPC + REST JSON | Topics, subscriptions, publish, pull, streaming pull, push delivery, snapshots, seek, field masks on update, subscription filters (attribute filter language) |
 | **Firestore** | gRPC | Documents, collections, structured queries with filters, ordering, and cursors, field transforms, aggregation (COUNT), transactions, batch writes, real-time listeners (`listen` stream) |
@@ -244,7 +246,7 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 | **Cloud Monitoring** | gRPC + REST JSON | Metric descriptors (create/get/list/delete), monitored resource descriptors, time series write (`CreateTimeSeries` with GCP validation rules) and read (`ListTimeSeries` with alignment/reduction subset and pagination) |
 | **Service Usage** | REST JSON | Enable/disable/list a project's services (`serviceusage.googleapis.com` v1) with done LROs; accept-and-succeed state store for Terraform `google_project_service`, Pulumi, and `gcloud services`; includes Cloud Resource Manager v1 `projects.get` and project IAM policy mixins for provider project lookups |
 | **Firebase Auth (Identity Platform)** | REST JSON | Identity Toolkit v1 wire-compatible with the official Auth emulator: email/password, anonymous and custom-token sign-in, unsigned emulator JWTs `firebase-admin` verifies, token refresh + revocation, admin user CRUD/list via `FIREBASE_AUTH_EMULATOR_HOST` |
-| **BigQuery (Phase 1)** | REST JSON | Datasets and tables CRUD with schema normalization, schema-validated `tabledata.insertAll`/`tabledata.list`, query jobs (`jobs.query`, `jobs.insert`, `getQueryResults`) over a SQL subset (`SELECT *`/columns/`COUNT(*)`, `WHERE =`, `LIMIT`) |
+| **BigQuery** | REST JSON | Datasets and tables CRUD with schema normalization, schema-validated `tabledata.insertAll`/`tabledata.list`, query jobs (`jobs.query`, `jobs.insert`, `getQueryResults`) running GoogleSQL (joins, aggregation, window functions, CTEs, `UNNEST`, parameters, dry runs) on a DuckDB sidecar |
 
 </details>
 
@@ -258,6 +260,7 @@ floci-gcp uses real Docker containers when in-process emulation would reduce fid
 | Cloud SQL for PostgreSQL and MySQL | `postgres:15.18-alpine` (15-18), `mysql:8.0.46` / `mysql:8.4.11` | PostgreSQL or MySQL engine, JDBC-compatible access | `FLOCI_GCP_SERVICES_CLOUDSQL_MOCK` |
 | Cloud Run | User-specified container image | Image-based service execution and request serving | `FLOCI_GCP_SERVICES_CLOUDRUN_MOCK` |
 | GKE (Kubernetes Engine) | `rancher/k3s:latest` | Real k3s Kubernetes clusters reachable via kubectl | `FLOCI_GCP_SERVICES_GKE_MOCK` |
+| BigQuery | `floci/floci-duck:latest` | GoogleSQL queries executed on a DuckDB engine | `FLOCI_GCP_SERVICES_BIGQUERY_MOCK` |
 
 Docker-backed services require the Docker socket:
 
@@ -280,6 +283,7 @@ docker run -d --name floci-gcp \
 | `FLOCI_GCP_SERVICES_CLOUDSQL_MYSQL80_IMAGE` | `mysql:8.0.46` |
 | `FLOCI_GCP_SERVICES_CLOUDSQL_MYSQL84_IMAGE` | `mysql:8.4.11` |
 | `FLOCI_GCP_SERVICES_GKE_DEFAULT_IMAGE` | `rancher/k3s:latest` |
+| `FLOCI_GCP_SERVICES_BIGQUERY_DUCK_DEFAULT_IMAGE` | `floci/floci-duck:latest` |
 
 ## Persistence and Storage Modes
 

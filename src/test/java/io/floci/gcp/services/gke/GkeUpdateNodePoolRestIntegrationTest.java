@@ -95,7 +95,9 @@ class GkeUpdateNodePoolRestIntegrationTest {
                 .statusCode(200)
                 .extract().path("version");
 
-        for (String body : new String[] {"{\"nodeVersion\":123}", "{\"nodeVersion\":{\"v\":\"1\"}}", "{\"nodeVersion\":\"1\"}"}) {
+        // "1.27" is a well-formed alias that matches no valid version (#231): a 400, not a stored alias.
+        for (String body : new String[] {"{\"nodeVersion\":123}", "{\"nodeVersion\":{\"v\":\"1\"}}",
+                "{\"nodeVersion\":\"1\"}", "{\"nodeVersion\":\"1.27\"}"}) {
             given()
                     .contentType("application/json")
                     .body(body)

@@ -7,10 +7,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -20,6 +23,210 @@ class BigQueryRestIntegrationTest {
     private static final String BASE = "/bigquery/v2/projects/" + PROJECT;
 
     private static String queryJobId;
+
+    @Test
+    @Order(0)
+    void datasetAccessEntriesRoundTripOverTheWire() {
+        // The hashicorp/google provider writes access[] on create and reads it
+        // back on every refresh. If the emulator drops it, `terraform plan`
+        // reports a permanent diff on a resource nobody changed.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"datasetReference": {"datasetId": "ds_access"},
+                         "access": [
+                           {"role": "READER", "userByEmail": "analyst@example.com"},
+                           {"role": "READER", "groupByEmail": "team@example.com"},
+                           {"role": "WRITER", "specialGroup": "projectWriters"},
+                           {"role": "READER", "iamMember": "serviceAccount:svc@example.iam.gserviceaccount.com"},
+                           {"role": "READER", "domain": "example.com"}]}
+                        """)
+                .when().post(BASE + "/datasets")
+                .then()
+                .statusCode(200)
+                .body("access", hasSize(5))
+                .body("access[0].userByEmail", equalTo("analyst@example.com"));
+
+        // A GET is the call the provider actually makes on refresh.
+        given()
+                .when().get(BASE + "/datasets/ds_access")
+                .then()
+                .statusCode(200)
+                .body("access", hasSize(5))
+                .body("access[1].groupByEmail", equalTo("team@example.com"))
+                .body("access[2].specialGroup", equalTo("projectWriters"))
+                .body("access[3].iamMember",
+                        equalTo("serviceAccount:svc@example.iam.gserviceaccount.com"))
+                .body("access[4].domain", equalTo("example.com"));
+
+        // PATCH omitting access[] must not clear it. The provider PATCHes
+        // when only an unrelated attribute such as friendlyName changes.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"friendlyName": "Access DS"}
+                        """)
+                .when().patch(BASE + "/datasets/ds_access")
+                .then()
+                .statusCode(200)
+                .body("friendlyName", equalTo("Access DS"))
+                .body("access", hasSize(5));
+
+        // PATCH carrying access[] replaces it wholesale.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"access": [{"role": "OWNER", "userByEmail": "owner@example.com"}]}
+                        """)
+                .when().patch(BASE + "/datasets/ds_access")
+                .then()
+                .statusCode(200)
+                .body("access", hasSize(1))
+                .body("access[0].role", equalTo("OWNER"));
+
+        // PUT is a full replacement, so an omitted access[] is a cleared one.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"friendlyName": "Replaced"}
+                        """)
+                .when().put(BASE + "/datasets/ds_access")
+                .then()
+                .statusCode(200)
+                .body("access", nullValue());
+    }
+
+    @Test
+    @Order(0)
+    void updateModeOverTheWireProtectsTheAclOnAMetadataOnlyWrite() {
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"datasetReference": {"datasetId": "ds_mode"},
+                         "description": "original",
+                         "access": [{"role": "READER", "userByEmail": "analyst@example.com"}]}
+                        """)
+                .when().post(BASE + "/datasets")
+                .then().statusCode(200).body("access", hasSize(1));
+
+        // A PUT is a full replacement, so without updateMode this body would
+        // clear the ACL. That is the case the parameter exists for.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"friendlyName": "metadata only"}
+                        """)
+                .when().put(BASE + "/datasets/ds_mode?updateMode=UPDATE_METADATA")
+                .then()
+                .statusCode(200)
+                .body("friendlyName", equalTo("metadata only"))
+                .body("description", nullValue())
+                .body("access", hasSize(1));
+
+        // UPDATE_ACL is the mirror: the ACL is replaced, metadata is untouched.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"access": [{"role": "OWNER", "userByEmail": "owner@example.com"}]}
+                        """)
+                .when().put(BASE + "/datasets/ds_mode?updateMode=UPDATE_ACL")
+                .then()
+                .statusCode(200)
+                .body("friendlyName", equalTo("metadata only"))
+                .body("access[0].role", equalTo("OWNER"));
+
+        // An unknown value is rejected rather than guessed at.
+        given()
+                .contentType("application/json")
+                .body("{}")
+                .when().put(BASE + "/datasets/ds_mode?updateMode=UPDATE_SOMETHING")
+                .then().statusCode(400);
+    }
+
+    @Test
+    @Order(0)
+    void nestedAccessVariantsRoundTripOverTheWire() {
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"datasetReference": {"datasetId": "ds_nested"},
+                         "access": [
+                           {"view": {"projectId": "p", "datasetId": "d", "tableId": "auth_view"}},
+                           {"routine": {"projectId": "p", "datasetId": "d", "routineId": "auth_routine"}},
+                           {"dataset": {"dataset": {"projectId": "p", "datasetId": "linked"},
+                                        "targetTypes": ["VIEWS"]}}]}
+                        """)
+                .when().post(BASE + "/datasets")
+                .then().statusCode(200);
+
+        given()
+                .when().get(BASE + "/datasets/ds_nested")
+                .then()
+                .statusCode(200)
+                .body("access", hasSize(3))
+                .body("access[0].view.tableId", equalTo("auth_view"))
+                .body("access[1].routine.routineId", equalTo("auth_routine"))
+                .body("access[2].dataset.dataset.datasetId", equalTo("linked"))
+                .body("access[2].dataset.targetTypes[0]", equalTo("VIEWS"));
+    }
+
+    @Test
+    @Order(0)
+    void accessConditionRoundTripsOverTheWire() {
+        // A conditional binding is what google_bigquery_dataset emits for an
+        // access block with a condition {}. The provider sends all four Expr
+        // fields and reads them back, so dropping any of them is a permanent
+        // diff on an ACL that otherwise looks right.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"datasetReference": {"datasetId": "ds_condition"},
+                         "access": [
+                           {"role": "READER",
+                            "userByEmail": "analyst@example.com",
+                            "condition": {
+                              "expression": "request.time < timestamp('2030-01-01T00:00:00Z')",
+                              "title": "expires_2030",
+                              "description": "temporary access for the analyst",
+                              "location": "dataset.tf:12"}},
+                           {"role": "OWNER", "userByEmail": "owner@example.com"}]}
+                        """)
+                .when().post(BASE + "/datasets")
+                .then()
+                .statusCode(200)
+                .body("access", hasSize(2));
+
+        given()
+                .when().get(BASE + "/datasets/ds_condition")
+                .then()
+                .statusCode(200)
+                .body("access[0].condition.expression",
+                        equalTo("request.time < timestamp('2030-01-01T00:00:00Z')"))
+                .body("access[0].condition.title", equalTo("expires_2030"))
+                .body("access[0].condition.description",
+                        equalTo("temporary access for the analyst"))
+                .body("access[0].condition.location", equalTo("dataset.tf:12"))
+                // an unconditional entry stays unconditional rather than
+                // growing an empty condition object
+                .body("access[1].condition", nullValue());
+
+        // The provider also sends condition on update, not only on create.
+        given()
+                .contentType("application/json")
+                .body("""
+                        {"access": [
+                           {"role": "WRITER",
+                            "userByEmail": "analyst@example.com",
+                            "condition": {"expression": "request.time < timestamp('2031-01-01T00:00:00Z')",
+                                          "title": "expires_2031"}}]}
+                        """)
+                .when().patch(BASE + "/datasets/ds_condition")
+                .then()
+                .statusCode(200)
+                .body("access", hasSize(1))
+                .body("access[0].condition.title", equalTo("expires_2031"))
+                .body("access[0].condition.description", nullValue());
+    }
 
     @Test
     @Order(1)
@@ -242,6 +449,38 @@ class BigQueryRestIntegrationTest {
 
     @Test
     @Order(8)
+    void nullCellsKeepTheirValueKey() {
+        given().contentType("application/json")
+                .body("{\"tableReference\": {\"tableId\": \"t_null\"}, \"schema\": {\"fields\": ["
+                        + "{\"name\": \"name\", \"type\": \"STRING\"}, {\"name\": \"age\", \"type\": \"INT64\"}]}}")
+                .when().post(BASE + "/datasets/ds1/tables").then().statusCode(200);
+        given().contentType("application/json")
+                .body("{\"rows\": [{\"json\": {\"name\": \"nul\"}}]}")
+                .when().post(BASE + "/datasets/ds1/tables/t_null/insertAll").then().statusCode(200);
+
+        // A NULL cell is {"v": null}; the Python client reads cell["v"] unconditionally.
+        given()
+                .when().get(BASE + "/datasets/ds1/tables/t_null/data")
+                .then()
+                .statusCode(200)
+                .body("rows[0].f[1]", hasKey("v"))
+                .body("rows[0].f[1].v", nullValue());
+    }
+
+    @Test
+    @Order(9)
+    void internalNdjsonRouteAnswersGetAndHead() {
+        String path = "/_floci-gcp/bigquery/projects/" + PROJECT + "/datasets/ds1/tables/t1/rows.ndjson";
+        String body = given().when().get(path).then().statusCode(200).extract().asString();
+        assertTrue(body.contains("\"name\":\"ana\""), body);
+
+        // DuckDB's httpfs probes with HEAD before reading. Deriving HEAD from the streaming GET
+        // left that probe hanging until httpfs timed out, so the route answers HEAD itself.
+        given().when().head(path).then().statusCode(200).body(emptyOrNullString());
+    }
+
+    @Test
+    @Order(10)
     void deleteSemantics() {
         given()
                 .when().delete(BASE + "/datasets/ds1")
@@ -260,5 +499,92 @@ class BigQueryRestIntegrationTest {
                 .then()
                 .statusCode(404)
                 .body("error.errors[0].reason", equalTo("notFound"));
+    }
+
+    @Test
+    @Order(9)
+    void tableMetadataRoundTripsOverRest() {
+        given().contentType("application/json")
+                .body("""
+                        {"datasetReference": {"datasetId": "meta"}, "defaultTableExpirationMs": 7200000,
+                         "defaultCollation": "und:ci"}
+                        """)
+                .when().post(BASE + "/datasets")
+                .then().statusCode(200)
+                .body("defaultTableExpirationMs", equalTo("7200000"))
+                .body("maxTimeTravelHours", equalTo("168"))
+                .body("type", equalTo("DEFAULT"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"tableReference": {"tableId": "events"},
+                         "schema": {"fields": [{"name": "day", "type": "DATE"}]},
+                         "timePartitioning": {"type": "DAY", "field": "day", "expirationMs": null},
+                         "clustering": {"fields": ["day"]}, "numRows": "999"}
+                        """)
+                .when().post(BASE + "/datasets/meta/tables")
+                .then().statusCode(200)
+                .body("timePartitioning.type", equalTo("DAY"))
+                .body("timePartitioning.expirationMs", nullValue())
+                .body("clustering.fields[0]", equalTo("day"))
+                .body("expirationTime", notNullValue())
+                .body("location", equalTo("US"))
+                .body("numRows", equalTo("0"));
+
+        // PATCH with an explicit null clears the field.
+        given().contentType("application/json")
+                .body("""
+                        {"clustering": null}
+                        """)
+                .when().patch(BASE + "/datasets/meta/tables/events")
+                .then().statusCode(200)
+                .body("clustering", nullValue())
+                .body("timePartitioning.field", equalTo("day"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"timePartitioning": {"field": "day"}}
+                        """)
+                .when().patch(BASE + "/datasets/meta/tables/events")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalid"));
+    }
+
+    @Test
+    @Order(11)
+    void malformedQueryRequestFieldsReturnAGcpErrorNotA500() {
+        // Erasure makes the queryParameters cast succeed, so a bad element used to surface as a
+        // ClassCastException. Nothing maps that, so the client got a 500 with no error body.
+        given().contentType("application/json")
+                .body("""
+                        {"query": "SELECT @p", "useLegacySql": false, "queryParameters": ["oops"]}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"query": "SELECT 1", "useLegacySql": false, "queryParameters": {"name": "p"}}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"query": 5, "useLegacySql": false}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"query": "SELECT 1", "useLegacySql": false, "parameterMode": 7}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
     }
 }
