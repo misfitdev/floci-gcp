@@ -111,6 +111,8 @@ can authorize supported GCS bucket and object operations and Secret Manager
 operations through inheritance. They do not enforce permissions on Pub/Sub or
 other unsupported services.
 Organization and folder inheritance and project ID/number alias equivalence are not implemented.
+A project whose recorded parent is an organization can use that organization's
+[custom roles](iam.md#custom-roles).
 See [IAM enforcement and limitations](iam.md#opt-in-enforcement).
 
 ## Scope and deviations
